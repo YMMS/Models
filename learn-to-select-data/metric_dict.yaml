@@ -1,0 +1,25 @@
+term:
+  - jensen_shannon
+  - renyi
+  - cosine
+  - euclidean
+  - variational
+  - bhattacharyya
+topic:
+  - jensen_shannon
+  - renyi
+  - cosine
+  - euclidean
+  - variational
+  - bhattacharyya
+word2vec:
+  - cosine
+  - euclidean
+  - variational
+diversity:
+  - num_word_types
+  - type_token_ratio
+  - entropy
+  - simpsons_index
+  - renyi_entropy
+  - quadratic_entropy

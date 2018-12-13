@@ -15,7 +15,12 @@ import logging
 import itertools
 import pickle
 import scipy
+import time
+import yaml
 import os
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn", lineno=196)
  
 logging.basicConfig(level=logging.INFO)
  
@@ -93,7 +98,8 @@ class Metric():
         summed = np.sum([np.power(p_word, alpha) for p_word in p_words])
         summed = 0.0001 if summed == 0 else summed
         return 1.0 / (1 - alpha) * np.log(summed)
- 
+
+    
 class AmazonReviewDataset():
    
     def __init__(self, dirpath, word2vector_path, max_vocab_size=10000, num_topics=50, num_topic_iterations=2000, num_topic_passes=10, reproc=False):
@@ -452,7 +458,104 @@ class AmazonReviewDataset():
             with open(filepath, "wb") as filew:
                 pickle.dump(diversity_feature, filew)
         return diversity_feature
- 
+
+class DataSelector():
+    
+    def __init__(self, dataset, select_num=1600, feature=None, weights=None, isbalance=True):
+        self.dataset = dataset
+        self.select_num = select_num
+        self.weights = weights
+        self.feature = feature
+        self.isbalance = isbalance
+    
+    def random(self, target_domain):
+        X, Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain != target_domain])
+        select_X, _, select_Y, _ = train_test_split(X, Y, train_size=self.select_num, stratify=Y)
+        return select_X, select_Y
+    
+    def all_source_data(self, target_domain):
+        select_X, select_Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain != target_domain])
+        return select_X, select_Y
+    
+    def most_similar_domain(self, target_domain):
+        max_sim, most_sim_domain = 0, None
+        target_texts = self.dataset.get_texts([target_domain], unlabeled=False)
+        trg_term_dist = self.dataset.get_texts_term_distribution(target_texts)
+        for domain in self.dataset.domains:
+            if domain == target_domain:continue
+            texts = self.dataset.get_texts([domain], unlabeled=False)
+            src_term_dist = self.dataset.get_texts_term_distribution(texts)
+            sim = Metric.jensen_shannon(src_term_dist, trg_term_dist)
+            if sim > max_sim:
+                max_sim, most_sim_domain = sim, domain
+        select_X, select_Y, _ = self.dataset.get_model_feature([most_sim_domain])
+        return select_X, select_Y
+    
+    def most_similar_examples(self, target_domain):
+        assert (self.feature is not None) and (self.weights is not None), "Weights must be assigned!"
+        source_X, source_Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain != target_domain])
+        scores = self.feature.dot(np.transpose(self.weights))
+        sorted_idx, _ = zip(*sorted(zip(range(len(scores)), scores), key=lambda x:x[1], reverse=True))
+        selected_idx = []
+        if self.isbalance:
+            if isinstance(source_Y, (list, tuple)):
+                label_sets = list(set(source_Y))
+            elif isinstance(source_Y, np.ndarray):
+                label_sets = list(set(source_Y.tolist()))
+            else:
+                raise NotImplementedError()
+            for label in label_sets:
+                selected_idx.extend([idx for idx in sorted_idx if source_Y[idx] == label][:int(self.select_num/len(label_sets))])      
+        else:
+            selected_idx = sorted_idx[:self.select_num]
+        select_X, select_Y = source_X[selected_idx], source_Y[selected_idx]
+        return select_X, select_Y
+        
+
+class BayesOptimizer():
+   
+    def __init__(self, model, lower, upper, num_iterations, select_num, isbalance=True):
+        self.model = model
+        self.lower = lower
+        self.upper = upper
+        self.num_iterations = num_iterations
+        self.select_num = select_num
+        self.isbalance = isbalance
+   
+    def _select(self, feature, weights, labels=None):
+        scores = feature.dot(np.transpose(weights))
+        sorted_idx, _ = zip(*sorted(zip(range(len(scores)), scores), key=lambda x:x[1], reverse=True))
+        selected_idx = []
+        if self.isbalance:
+            assert labels is not None, "When use balance mode, labels is required!"
+            if isinstance(labels, (list, tuple)):
+                label_sets = list(set(labels))
+            elif isinstance(labels, np.ndarray):
+                label_sets = list(set(labels.tolist()))
+            else:
+                raise NotImplementedError()
+            for label in label_sets:
+                selected_idx.extend([idx for idx in sorted_idx if labels[idx] == label][:int(self.select_num/len(label_sets))])      
+        else:
+            selected_idx = sorted_idx[:self.select_num]
+        return selected_idx
+    
+    def get_weights(self, feature, X, Y, val_X, val_Y):
+       
+        def objective_function(weights):
+            selected_idx = self._select(feature, weights, Y)
+            select_X, select_Y = X[selected_idx], Y[selected_idx]
+            self.model.train(select_X, select_Y)
+            error = self.model.loss(val_X, val_Y)
+            return error
+       
+        return bayesian_optimization(
+            objective_function=objective_function,
+            lower=self.lower,
+            upper=self.upper,
+            num_iterations=self.num_iterations
+        )['x_opt']
+
 class Model():
    
     def __init__(self, name="svm.SVC"):
@@ -473,203 +576,121 @@ class Model():
         _, acc = self.infer(X, Y)
         error = 1 - float(acc)
         return error
-       
- 
-class BayesOptimizer():
-   
-    def __init__(self, model, lower, upper, num_iterations):
-        self.model = model
-        self.lower = lower
-        self.upper = upper
-        self.num_iterations = num_iterations
-   
-    def select_data(self, feature, weights, select_num, labels=None, isbalance=True):
-        scores = feature.dot(np.transpose(weights))
-        sorted_idx, _ = zip(*sorted(zip(range(len(scores)), scores), key=lambda x:x[1], reverse=True))
-        selected_idx = []
-        if isbalance:
-            assert labels is not None, "When use balance mode, labels is required!"
-            if isinstance(labels, (list, tuple)):
-                label_sets = list(set(labels))
-            elif isinstance(labels, np.ndarray):
-                label_sets = list(set(labels.tolist()))
-            else:
-                raise NotImplementedError()
-            for label in label_sets:
-                selected_idx.extend([idx for idx in sorted_idx if labels[idx] == label][:int(select_num/len(label_sets))])      
-        else:
-            selected_idx = sorted_idx[:select_num]
-        return selected_idx
-   
-    def train_weights(self, feature, X, Y, val_X, val_Y, select_num=1600, isbalance=True):
-       
-        def objective_function(weights):
-            selected_idx = self.select_data(feature, weights, select_num, Y, isbalance)
-            select_X, select_Y = X[selected_idx], Y[selected_idx]
-            self.model.train(select_X, select_Y)
-            error = self.model.loss(val_X, val_Y)
-            return error
-       
-        return bayesian_optimization(
-            objective_function=objective_function,
-            lower=self.lower,
-            upper=self.upper,
-            num_iterations=self.num_iterations
-        )['x_opt']
- 
- 
-#dirpath="./amazon-reviews/processed_acl/"
-#word2vector_path="./glove.42B.300d.txt"
-#target_domain="kitchen"
-#metric_dict = {
-#    "term":['jensen_shannon', 'renyi', 'cosine', 'euclidean', 'variational', 'bhattacharyya'],
-#    "topic":['jensen_shannon', 'renyi', 'cosine', 'euclidean', 'variational', 'bhattacharyya'],
-#    "word2vec":['cosine', 'euclidean', 'variational'],
-#    "diversity":['num_word_types', 'type_token_ratio', 'entropy', 'simpsons_index', 'renyi_entropy', 'quadratic_entropy']
-#}
-#select_num=1600
-#test_size=100
-#num_iterations = 20
-#select_methods = ["most_similar_examples", "random", "all_source_data", "most_similar_domain"]
- 
- 
-class Experiments():
-   
-    def __init__(self, dirpath, word2vector_path, select_methods, num_topics, num_topic_iterations, num_topic_passes, reproc=False):
-        self.dataset = AmazonReviewDataset(
-            dirpath, 
-            word2vector_path, 
-            max_vocab_size=10000, 
-            num_topics=num_topics, 
-            num_topic_iterations=num_topic_iterations, 
-            num_topic_passes=num_topic_passes, 
-            reproc=reproc
-        )
-        self.select_methods = select_methods
-       
-    def target_data(self, target_domain, valid_size):
-        target_X, target_Y, _ = self.dataset.get_model_feature([target_domain])
-        test_target_X, val_target_X, test_target_Y, val_target_Y = train_test_split(target_X, target_Y, test_size=valid_size, stratify=target_Y)
-        self.test_data = (test_target_X, test_target_Y)
-        self.valid_data = (val_target_X, val_target_Y)
-   
-    def select_most_similar_examples(self, target_domain, select_num, num_iterations, isbalance=True):
-        val_target_X, val_target_Y = self.valid_data
-        feature = self.dataset.get_metric_feature(target_domain, metric_dict)
-        proxy_model = Model()
-        source_X, source_Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain !=target_domain])
-        ######################################################
-        n_dim = feature.shape[-1]
-        lower = np.array(n_dim * [-1])
-        upper = np.array(n_dim * [1])
-        opt = BayesOptimizer(proxy_model, lower, upper, num_iterations)
-        ######################################################
-        weights = opt.train_weights(
-            feature=feature,
-            X=source_X,
-            Y=source_Y,
-            val_X=val_target_X,
-            val_Y=val_target_Y,
-            select_num=select_num,
-            isbalance=isbalance
-        )
-        selected_idx = opt.select_data(
-            feature=feature,
-            weights=weights,
-            select_num=select_num,
-            labels=source_Y,
-            isbalance=isbalance
-        )
-        select_X, select_Y = source_X[selected_idx], source_Y[selected_idx]
-        return select_X, select_Y
-   
-    def select_random(self, target_domain, select_num):
-        source_X, source_Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain !=target_domain])
-        select_X, _, select_Y, _ = train_test_split(source_X, source_Y, train_size=select_num, stratify=source_Y)
-        return select_X, select_Y
-   
-    def select_all_source_data(self, target_domain):
-        source_X, source_Y, _ = self.dataset.get_model_feature([domain for domain in self.dataset.domains if domain !=target_domain])
-        return source_X, source_Y
-   
-    def select_most_similar_domain(self, target_domain, matric_name="jensen_shannon"):
-        max_sim, most_sim_domain = 0, None
-        target_texts = self.dataset.get_texts([target_domain], unlabeled=False)
-        trg_term_dist = self.dataset.get_texts_term_distribution(target_texts)
-        for domain in self.dataset.domains:
-            if domain == target_domain:continue
-            texts = self.dataset.get_texts([domain], unlabeled=False)
-            src_term_dist = self.dataset.get_texts_term_distribution(texts)
-            sim = getattr(Metric, matric_name)(src_term_dist, trg_term_dist)
-            if sim > max_sim:
-                max_sim, most_sim_domain = sim, domain
-        source_X, source_Y, _ = self.dataset.get_model_feature([most_sim_domain])
-        return source_X, source_Y
-   
-    def train_valid_test(self, train_data):
-        model = Model()
-        model.train(*train_data)
-        _, valid_acc = model.infer(*self.valid_data)
-        _, test_acc = model.infer(*self.test_data)
-        return valid_acc, test_acc
-       
     
-    def run(self, target_domain, select_methods, select_num, valid_size, num_iterations, isbalance):
-        self.target_data(target_domain, valid_size)
-        results = []
-        for select_method in select_methods:
-            if select_method in ["all_source_data", "most_similar_domain"]:
-                train_data = getattr(self, "select_{}".format(select_method))(target_domain)
-            elif select_method in ["random"]:
-                train_data = getattr(self, "select_{}".format(select_method))(target_domain, select_num)
-            elif select_method in ["most_similar_examples"]:
-                train_data = getattr(self, "select_{}".format(select_method))(target_domain, select_num, num_iterations, isbalance=isbalance)
-            else:
-                raise NotImplementedError()
-            valid_acc, test_acc = self.train_valid_test(train_data)
-            result = (target_domain, select_method, valid_acc, test_acc)
-            print(result)
-            results.append(result)
-        return results
 
-metric_dict = {
-    "term":['jensen_shannon', 'renyi', 'cosine', 'euclidean', 'variational', 'bhattacharyya'],
-    "topic":['jensen_shannon', 'renyi', 'cosine', 'euclidean', 'variational', 'bhattacharyya'],
-    "word2vec":['cosine', 'euclidean', 'variational'],
-    "diversity":['num_word_types', 'type_token_ratio', 'entropy', 'simpsons_index', 'renyi_entropy', 'quadratic_entropy']
-}
-   
- 
+class Experiment():
+    
+    def __init__(self, dataset, selector, valid_size=100):
+        self.dataset = dataset
+        self.selector = selector
+        self.valid_size = valid_size
+        
+    def resample_val_test(self, target_domain):
+        target_X, target_Y, _ = self.dataset.get_model_feature([target_domain])
+        test_target_X, val_target_X, test_target_Y, val_target_Y = train_test_split(
+            target_X, target_Y, 
+            test_size=self.valid_size, 
+            stratify=target_Y
+        )
+        self.test_data = (test_target_X, test_target_Y)
+        self.val_data = (val_target_X, val_target_Y)
+    
+    def __call__(self, target_domain, baseline, resample=False):
+        #######################################################
+        if not hasattr(self, "test_data") or resample:
+            target_X, target_Y, _ = self.dataset.get_model_feature([target_domain])
+            test_target_X, val_target_X, test_target_Y, val_target_Y = train_test_split(
+                target_X, target_Y, 
+                test_size=self.valid_size, 
+                stratify=target_Y
+            )
+            self.test_data = (test_target_X, test_target_Y)
+            self.val_data = (val_target_X, val_target_Y)
+        else:
+            pass
+        #######################################################
+        train_data = getattr(self.selector, baseline)(target_domain)
+        train_num_samples = train_data[0].shape[0]
+        model = Model()
+        start_time = time.time()
+        model.train(*train_data)
+        cost_time = time.time() - start_time
+        print("Train random! cost: {} on {} samples".format(cost_time, train_num_samples))
+        val_num_samples = self.val_data[0].shape[0]
+        _, val_acc = model.infer(*self.val_data)
+        val_loss = model.loss(*self.val_data)
+        print("Valid random! loss: {}, acc: {} on {} samples".format(val_loss, val_acc, val_num_samples))
+        test_num_samples = self.test_data[0].shape[0]
+        _, test_acc = model.infer(*self.test_data)
+        test_loss = model.loss(*self.test_data)
+        print("Test random! loss: {}, acc: {} on {} samples".format(test_loss, test_acc, test_num_samples))
+        
 if __name__ == "__main__":
     import argparse
     import ast
     parser = argparse.ArgumentParser()
     parser.add_argument('--dirpath', type=str, default="/home/yangming/Datasets/amazon-reviews/processed_acl/")
     parser.add_argument('--word2vector_path', type=str, default="/home/yangming/Datasets/Glove/glove.42B.300d.txt")
+    parser.add_argument('--metric_dict_path', type=str, default="./metric_dict.yaml")
     parser.add_argument('--reproc', type=ast.literal_eval, default=False)
+    parser.add_argument('--isbalance', type=ast.literal_eval, default=True)
     parser.add_argument('--target_domain', type=str, default="kitchen")
+    parser.add_argument('--max_vocab_size', type=int, default=10000)
     parser.add_argument('--num_topics', type=int, default=50)
     parser.add_argument('--num_topic_iterations', type=int, default=2000)
     parser.add_argument('--num_topic_passes', type=int, default=10)
     parser.add_argument('--select_num', type=int, default=1600)
     parser.add_argument('--valid_size', type=int, default=100)
-    parser.add_argument('--num_iterations', type=int, default=20)
+    parser.add_argument('--num_iterations', type=int, default=100)
+    parser.add_argument('--cv_fold', type=int, default=10)
     parser.add_argument('--select_methods', nargs='+', type=str, default="most_similar_examples random all_source_data most_similar_domain")
     args = parser.parse_args()
-    exp = Experiments(
+    #####################################################################
+    dataset = AmazonReviewDataset(
         dirpath=args.dirpath, 
         word2vector_path=args.word2vector_path, 
-        select_methods=args.select_methods, 
-        num_topics=args.num_topics,
-        num_topic_iterations=args.num_topic_iterations,
-        num_topic_passes=args.num_topic_passes,
+        max_vocab_size=args.max_vocab_size, 
+        num_topics=args.num_topics, 
+        num_topic_iterations=args.num_topic_iterations, 
+        num_topic_passes=args.num_topic_passes, 
         reproc=args.reproc
     )
-    exp.run(
-        target_domain=args.target_domain, 
-        select_methods=args.select_methods,
-        select_num=args.select_num,
-        valid_size=args.valid_size,
-        num_iterations=args.num_iterations,
-        isbalance=True
-    )
+    #####################################################################
+    feature, weights = None, None
+    if "most_similar_examples" in args.select_methods:
+        proxy_model = Model()
+        with open(args.metric_dict_path, "r") as filer:
+            metric_dict = yaml.load(filer)
+        start_time = time.time()
+        feature = dataset.get_metric_feature(args.target_domain, metric_dict)
+        print("build metric feature for target domain: {} cost: {}".format(args.target_domain, time.time() - start_time))
+        n_dim = feature.shape[-1]
+        lower = np.array(n_dim * [-1])
+        upper = np.array(n_dim * [1])
+        opt = BayesOptimizer(
+            model=proxy_model, 
+            lower=lower, 
+            upper=upper, 
+            num_iterations=args.num_iterations,
+            select_num=args.select_num,
+            isbalance=args.isbalance
+        )
+        X, Y, _ = dataset.get_model_feature([domain for domain in dataset.domains if domain !=args.target_domain])
+        target_X, target_Y, _ = dataset.get_model_feature([args.target_domain])
+        _, val_X, _, val_Y = train_test_split(target_X, target_Y, test_size=args.valid_size, stratify=target_Y)
+        start_time = time.time()
+        weights = opt.get_weights(feature, X, Y, val_X, val_Y)
+    #####################################################################
+    selector = DataSelector(dataset, select_num=args.select_num, feature=feature, weights=weights)
+    #####################################################################
+    exp = Experiment(dataset, selector, valid_size=args.valid_size)
+    for i in range(args.cv_fold):
+        print("############################")
+        print("cv-{}".format(i))
+        exp.resample_val_test(args.target_domain)
+        for baseline in args.select_methods.split():
+            print("------------------------")
+            print(baseline)
+            exp(args.target_domain, baseline)
+            print("------------------------")
+        print("############################")
