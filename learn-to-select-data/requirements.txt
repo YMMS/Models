@@ -36,4 +36,4 @@ sgmcmc==0.0.1
 six==1.11.0
 smart-open==1.7.1
 Theano==0.9.0
-urllib3==1.24.1
+urllib3==1.24.2
